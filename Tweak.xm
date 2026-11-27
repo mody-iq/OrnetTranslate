@@ -7,7 +7,11 @@ static UIButton *gButton = nil;
 static BOOL gBusy = NO;
 static volatile int32_t gOKCount = 0;
 static volatile int32_t gFailCount = 0;
-static NSString *gLastErr = nil;
+static volatile int32_t gMSOK = 0;
+static volatile int32_t gMSFail = 0;
+static NSMutableDictionary *gErrs = nil;
+static NSString *gMSToken = nil;
+static NSDate *gMSTokenDate = nil;
 static NSString *const kOTLock = @"ot.lock";
 
 static NSString *const kOTCollectJS =
@@ -77,7 +81,7 @@ static void OTToast(NSString *msg) {
         l.frame = CGRectMake((win.bounds.size.width - w) / 2,
                              win.safeAreaInsets.top + 60, w, h);
         [win addSubview:l];
-        [UIView animateWithDuration:0.3 delay:3.0 options:0 animations:^{
+        [UIView animateWithDuration:0.3 delay:4.0 options:0 animations:^{
             l.alpha = 0;
         } completion:^(BOOL finished) {
             [l removeFromSuperview];
@@ -93,14 +97,32 @@ static void OTFinish(NSString *msg) {
     });
 }
 
-static void OTSetErr(NSString *e) {
-    @synchronized (kOTLock) { gLastErr = e; }
+static void OTResetErrs(void) {
+    @synchronized (kOTLock) { gErrs = [NSMutableDictionary dictionary]; }
 }
 
-static NSString *OTGetErr(void) {
-    NSString *e = nil;
-    @synchronized (kOTLock) { e = gLastErr; }
-    return e;
+static void OTSetErr(NSString *key, NSString *val) {
+    if (!key || !val) return;
+    @synchronized (kOTLock) {
+        if (!gErrs) gErrs = [NSMutableDictionary dictionary];
+        gErrs[key] = val;
+    }
+}
+
+static NSString *OTErrSummary(void) {
+    NSMutableArray *parts = [NSMutableArray array];
+    @synchronized (kOTLock) {
+        for (NSString *k in @[@"T", @"M", @"G", @"C", @"L"]) {
+            NSString *v = gErrs[k];
+            if (v) [parts addObject:[NSString stringWithFormat:@"%@:%@", k, v]];
+        }
+    }
+    return parts.count ? [parts componentsJoinedByString:@" "] : @"?";
+}
+
+static NSString *OTCodeStr(NSError *err, NSInteger code) {
+    if (err) return [NSString stringWithFormat:@"e%ld", (long)err.code];
+    return [NSString stringWithFormat:@"%ld", (long)code];
 }
 
 static void OTCollectWebViews(UIView *v, NSMutableArray *out) {
@@ -140,8 +162,8 @@ static NSURLSession *OTSession(void) {
     dispatch_once(&once, ^{
         NSURLSessionConfiguration *c = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         c.HTTPMaximumConnectionsPerHost = 4;
-        c.timeoutIntervalForRequest = 10;
-        c.timeoutIntervalForResource = 20;
+        c.timeoutIntervalForRequest = 15;
+        c.timeoutIntervalForResource = 30;
         c.HTTPAdditionalHeaders = @{
             @"User-Agent": @"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
             @"Accept": @"application/json, text/plain, */*"
@@ -150,6 +172,112 @@ static NSURLSession *OTSession(void) {
     });
     return s;
 }
+
+#pragma mark - Microsoft Edge Translate (batched)
+
+static NSString *OTFetchMSToken(void) {
+    @synchronized (kOTLock) {
+        if (gMSToken && gMSTokenDate && [[NSDate date] timeIntervalSinceDate:gMSTokenDate] < 480) {
+            return gMSToken;
+        }
+    }
+    NSURL *url = [NSURL URLWithString:@"https://edge.microsoft.com/translate/auth"];
+    if (!url) return nil;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                   timeoutInterval:15];
+    req.HTTPMethod = @"GET";
+    __block NSString *tok = nil;
+    dispatch_semaphore_t s = dispatch_semaphore_create(0);
+    [[OTSession() dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *resp, NSError *err) {
+        NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)resp statusCode] : 0;
+        if (!err && code == 200 && d.length > 20) {
+            NSString *t = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+            t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (t.length > 20) tok = t;
+        }
+        if (!tok) OTSetErr(@"T", OTCodeStr(err, code));
+        dispatch_semaphore_signal(s);
+    }] resume];
+    dispatch_semaphore_wait(s, DISPATCH_TIME_FOREVER);
+    if (tok) {
+        @synchronized (kOTLock) {
+            gMSToken = tok;
+            gMSTokenDate = [NSDate date];
+        }
+    }
+    return tok;
+}
+
+static NSArray<NSString *> *OTMSTranslateBatch(NSArray<NSString *> *batch) {
+    if (gMSOK == 0 && gMSFail >= 2) return nil;
+    NSString *tok = OTFetchMSToken();
+    if (!tok) { __sync_fetch_and_add(&gMSFail, 1); return nil; }
+
+    NSMutableArray *body = [NSMutableArray arrayWithCapacity:batch.count];
+    for (NSString *t in batch) [body addObject:@{@"Text": t}];
+    NSData *bd = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    if (!bd) return nil;
+
+    NSArray *hosts = @[@"https://api-edge.cognitive.microsofttranslator.com",
+                       @"https://api.cognitive.microsofttranslator.com"];
+    for (NSString *host in hosts) {
+        NSURL *url = [NSURL URLWithString:[host stringByAppendingString:@"/translate?to=ar&api-version=3.0&includeSentenceLength=true"]];
+        if (!url) continue;
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                       timeoutInterval:20];
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json; charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
+        [req setValue:[@"Bearer " stringByAppendingString:tok] forHTTPHeaderField:@"Authorization"];
+        req.HTTPBody = bd;
+
+        __block NSArray *out = nil;
+        __block NSInteger code = 0;
+        __block NSError *nerr = nil;
+        dispatch_semaphore_t s = dispatch_semaphore_create(0);
+        [[OTSession() dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *resp, NSError *err) {
+            nerr = err;
+            code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)resp statusCode] : 0;
+            if (!err && code == 200 && d.length) {
+                id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                if ([obj isKindOfClass:[NSArray class]] && [(NSArray *)obj count] == batch.count) {
+                    NSMutableArray *res = [NSMutableArray array];
+                    BOOL ok = YES;
+                    for (id item in (NSArray *)obj) {
+                        NSString *txt = nil;
+                        if ([item isKindOfClass:[NSDictionary class]]) {
+                            id trs = ((NSDictionary *)item)[@"translations"];
+                            if ([trs isKindOfClass:[NSArray class]] && [(NSArray *)trs count] > 0) {
+                                id f = [(NSArray *)trs objectAtIndex:0];
+                                if ([f isKindOfClass:[NSDictionary class]]) {
+                                    id tx = ((NSDictionary *)f)[@"text"];
+                                    if ([tx isKindOfClass:[NSString class]]) txt = tx;
+                                }
+                            }
+                        }
+                        if (!txt) { ok = NO; break; }
+                        [res addObject:txt];
+                    }
+                    if (ok) out = res;
+                }
+            }
+            dispatch_semaphore_signal(s);
+        }] resume];
+        dispatch_semaphore_wait(s, DISPATCH_TIME_FOREVER);
+
+        if (out) { __sync_fetch_and_add(&gMSOK, 1); return out; }
+        OTSetErr(@"M", OTCodeStr(nerr, code));
+        if (code == 401) {
+            @synchronized (kOTLock) { gMSToken = nil; }
+            break;
+        }
+    }
+    __sync_fetch_and_add(&gMSFail, 1);
+    return nil;
+}
+
+#pragma mark - Fallback providers (per text)
 
 static NSString *OTEncode(NSString *text) {
     NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
@@ -222,17 +350,12 @@ static void OTTryProvider(NSUInteger provider, NSString *text, void (^done)(NSSt
     if (provider >= 3) { done(nil); return; }
     NSMutableURLRequest *req = OTBuildRequest(provider, text);
     if (!req) { OTTryProvider(provider + 1, text, done); return; }
+    NSArray *names = @[@"G", @"C", @"L"];
     [[OTSession() dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *resp, NSError *err) {
         NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)resp statusCode] : 0;
         NSString *res = (!err && code == 200) ? OTParseJSON(d) : nil;
         if (res) { done(res); return; }
-        NSString *why;
-        if (err) {
-            why = [NSString stringWithFormat:@"P%lu err %ld", (unsigned long)provider, (long)err.code];
-        } else {
-            why = [NSString stringWithFormat:@"P%lu HTTP %ld", (unsigned long)provider, (long)code];
-        }
-        OTSetErr(why);
+        OTSetErr(names[provider], OTCodeStr(err, code));
         OTTryProvider(provider + 1, text, done);
     }] resume];
 }
@@ -246,12 +369,16 @@ static void OTTranslateText(NSString *text, void (^done)(NSString *)) {
     });
 }
 
+#pragma mark - Main translate flow
+
 static void OTTranslateWebView(WKWebView *wv) {
     gBusy = YES;
     gButton.alpha = 0.5;
     gOKCount = 0;
     gFailCount = 0;
-    OTSetErr(nil);
+    gMSOK = 0;
+    gMSFail = 0;
+    OTResetErrs();
     OTToast(@"جارٍ الترجمة…");
     [wv evaluateJavaScript:kOTCollectJS completionHandler:^(id result, NSError *error) {
         NSArray *texts = nil;
@@ -270,19 +397,52 @@ static void OTTranslateWebView(WKWebView *wv) {
                 NSString *s = [(NSString *)t stringByTrimmingCharactersInSet:ws];
                 if (s.length) [uniq addObject:s];
             }
+            NSArray<NSString *> *list = [uniq array];
             NSMutableDictionary<NSString *, NSString *> *cache = [NSMutableDictionary dictionary];
-            dispatch_semaphore_t sem = dispatch_semaphore_create(4);
-            dispatch_group_t grp = dispatch_group_create();
-            for (NSString *t in uniq) {
-                dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-                dispatch_group_enter(grp);
-                OTTranslateText(t, ^(NSString *out) {
-                    if (out) { @synchronized (cache) { cache[t] = out; } }
-                    dispatch_semaphore_signal(sem);
-                    dispatch_group_leave(grp);
+
+            // Phase 1: Microsoft, batched
+            const NSUInteger kBatch = 25;
+            dispatch_semaphore_t sem1 = dispatch_semaphore_create(3);
+            dispatch_group_t grp1 = dispatch_group_create();
+            for (NSUInteger i = 0; i < list.count; i += kBatch) {
+                NSUInteger len = MIN(kBatch, list.count - i);
+                NSArray<NSString *> *sub = [list subarrayWithRange:NSMakeRange(i, len)];
+                dispatch_semaphore_wait(sem1, DISPATCH_TIME_FOREVER);
+                dispatch_group_enter(grp1);
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    NSArray<NSString *> *res = OTMSTranslateBatch(sub);
+                    if (res && res.count == sub.count) {
+                        @synchronized (cache) {
+                            for (NSUInteger j = 0; j < sub.count; j++) cache[sub[j]] = res[j];
+                        }
+                    }
+                    dispatch_semaphore_signal(sem1);
+                    dispatch_group_leave(grp1);
                 });
             }
-            dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+            dispatch_group_wait(grp1, DISPATCH_TIME_FOREVER);
+
+            // Phase 2: fallback per text for whatever is still missing
+            NSMutableArray<NSString *> *missing = [NSMutableArray array];
+            for (NSString *t in list) {
+                BOOL has = NO;
+                @synchronized (cache) { has = (cache[t] != nil); }
+                if (!has) [missing addObject:t];
+            }
+            if (missing.count > 0) {
+                dispatch_semaphore_t sem2 = dispatch_semaphore_create(4);
+                dispatch_group_t grp2 = dispatch_group_create();
+                for (NSString *t in missing) {
+                    dispatch_semaphore_wait(sem2, DISPATCH_TIME_FOREVER);
+                    dispatch_group_enter(grp2);
+                    OTTranslateText(t, ^(NSString *out) {
+                        if (out) { @synchronized (cache) { cache[t] = out; } }
+                        dispatch_semaphore_signal(sem2);
+                        dispatch_group_leave(grp2);
+                    });
+                }
+                dispatch_group_wait(grp2, DISPATCH_TIME_FOREVER);
+            }
 
             NSMutableDictionary *map = [NSMutableDictionary dictionary];
             for (NSUInteger i = 0; i < texts.count; i++) {
@@ -294,8 +454,7 @@ static void OTTranslateWebView(WKWebView *wv) {
                 if (tr) map[[NSString stringWithFormat:@"%lu", (unsigned long)i]] = tr;
             }
             if (map.count == 0) {
-                NSString *why = OTGetErr();
-                OTFinish([NSString stringWithFormat:@"فشلت الترجمة [%@]", why.length ? why : @"?"]);
+                OTFinish([NSString stringWithFormat:@"فشلت الترجمة [%@]", OTErrSummary()]);
                 return;
             }
             NSData *jd = [NSJSONSerialization dataWithJSONObject:map options:0 error:nil];
