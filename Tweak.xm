@@ -5,6 +5,10 @@
 
 static UIButton *gButton = nil;
 static BOOL gBusy = NO;
+static volatile int32_t gOKCount = 0;
+static volatile int32_t gFailCount = 0;
+static NSString *gLastErr = nil;
+static NSString *const kOTLock = @"ot.lock";
 
 static NSString *const kOTCollectJS =
 @"(function(){try{"
@@ -20,7 +24,7 @@ static NSString *const kOTCollectJS =
 @"if(!t||t.trim().length<2||t.length>1200)continue;"
 @"if(!/\\p{L}/u.test(t)||/\\p{Script=Arabic}/u.test(t))continue;"
 @"nodes.push(n);orig.push(t);texts.push(t);"
-@"if(nodes.length>=600)break;"
+@"if(nodes.length>=400)break;"
 @"}"
 @"window.__ot={n:nodes,o:orig,on:false};"
 @"window.__otApply=function(m){var s=window.__ot;if(!s)return 0;var c=0;"
@@ -59,21 +63,21 @@ static void OTToast(NSString *msg) {
         if (!win) return;
         UILabel *l = [[UILabel alloc] init];
         l.text = msg;
+        l.numberOfLines = 0;
         l.font = [UIFont boldSystemFontOfSize:14];
         l.textColor = [UIColor whiteColor];
-        l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
+        l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
         l.textAlignment = NSTextAlignmentCenter;
-        l.layer.cornerRadius = 16;
+        l.layer.cornerRadius = 14;
         l.clipsToBounds = YES;
-        [l sizeToFit];
-        CGRect fr = l.frame;
-        fr.size.height = 32;
-        fr.size.width = MIN(fr.size.width + 28, win.bounds.size.width - 40);
-        fr.origin.x = (win.bounds.size.width - fr.size.width) / 2;
-        fr.origin.y = win.safeAreaInsets.top + 60;
-        l.frame = fr;
+        CGFloat maxW = win.bounds.size.width - 40;
+        CGSize sz = [l sizeThatFits:CGSizeMake(maxW - 28, CGFLOAT_MAX)];
+        CGFloat w = MIN(sz.width + 28, maxW);
+        CGFloat h = sz.height + 16;
+        l.frame = CGRectMake((win.bounds.size.width - w) / 2,
+                             win.safeAreaInsets.top + 60, w, h);
         [win addSubview:l];
-        [UIView animateWithDuration:0.3 delay:1.8 options:0 animations:^{
+        [UIView animateWithDuration:0.3 delay:3.0 options:0 animations:^{
             l.alpha = 0;
         } completion:^(BOOL finished) {
             [l removeFromSuperview];
@@ -87,6 +91,16 @@ static void OTFinish(NSString *msg) {
         gButton.alpha = 1.0;
         if (msg.length) OTToast(msg);
     });
+}
+
+static void OTSetErr(NSString *e) {
+    @synchronized (kOTLock) { gLastErr = e; }
+}
+
+static NSString *OTGetErr(void) {
+    NSString *e = nil;
+    @synchronized (kOTLock) { e = gLastErr; }
+    return e;
 }
 
 static void OTCollectWebViews(UIView *v, NSMutableArray *out) {
@@ -125,48 +139,119 @@ static NSURLSession *OTSession(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSURLSessionConfiguration *c = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        c.HTTPMaximumConnectionsPerHost = 6;
-        c.timeoutIntervalForRequest = 15;
+        c.HTTPMaximumConnectionsPerHost = 4;
+        c.timeoutIntervalForRequest = 10;
+        c.timeoutIntervalForResource = 20;
+        c.HTTPAdditionalHeaders = @{
+            @"User-Agent": @"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+            @"Accept": @"application/json, text/plain, */*"
+        };
         s = [NSURLSession sessionWithConfiguration:c];
     });
     return s;
 }
 
-static void OTTranslateText(NSString *text, void (^done)(NSString *)) {
+static NSString *OTEncode(NSString *text) {
     NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:
         @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"];
-    NSString *enc = [text stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-    if (!enc) { done(nil); return; }
-    NSString *u = [NSString stringWithFormat:
-        @"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=%@", enc];
-    NSURL *url = [NSURL URLWithString:u];
-    if (!url) { done(nil); return; }
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                   timeoutInterval:15];
-    [[OTSession() dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *resp, NSError *err) {
-        NSString *res = nil;
-        if (d && !err) {
-            id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-            if ([obj isKindOfClass:[NSArray class]] && [(NSArray *)obj count] > 0 &&
-                [obj[0] isKindOfClass:[NSArray class]]) {
-                NSMutableString *s = [NSMutableString string];
-                for (id seg in (NSArray *)obj[0]) {
-                    if ([seg isKindOfClass:[NSArray class]] && [(NSArray *)seg count] > 0 &&
-                        [seg[0] isKindOfClass:[NSString class]]) {
-                        [s appendString:seg[0]];
-                    }
+    return [text stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+}
+
+static NSString *OTParseJSON(NSData *d) {
+    if (d.length == 0) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    NSMutableString *s = [NSMutableString string];
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)obj;
+        id sents = dict[@"sentences"];
+        if ([sents isKindOfClass:[NSArray class]]) {
+            for (id seg in (NSArray *)sents) {
+                if ([seg isKindOfClass:[NSDictionary class]]) {
+                    id tr = ((NSDictionary *)seg)[@"trans"];
+                    if ([tr isKindOfClass:[NSString class]]) [s appendString:tr];
                 }
-                if (s.length) res = s;
             }
         }
-        done(res);
+        id lt = dict[@"translation"];
+        if (s.length == 0 && [lt isKindOfClass:[NSString class]]) [s appendString:lt];
+    } else if ([obj isKindOfClass:[NSArray class]] && [(NSArray *)obj count] > 0) {
+        id first = [(NSArray *)obj objectAtIndex:0];
+        if ([first isKindOfClass:[NSArray class]]) {
+            for (id seg in (NSArray *)first) {
+                if ([seg isKindOfClass:[NSArray class]] && [(NSArray *)seg count] > 0) {
+                    id t0 = [(NSArray *)seg objectAtIndex:0];
+                    if ([t0 isKindOfClass:[NSString class]]) [s appendString:t0];
+                }
+            }
+        } else if ([first isKindOfClass:[NSString class]]) {
+            [s appendString:first];
+        }
+    }
+    return s.length ? [s copy] : nil;
+}
+
+static NSMutableURLRequest *OTBuildRequest(NSUInteger provider, NSString *text) {
+    NSString *enc = OTEncode(text);
+    if (!enc) return nil;
+    NSMutableURLRequest *req = nil;
+    if (provider == 0 || provider == 1) {
+        NSString *u = (provider == 0)
+            ? @"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t"
+            : @"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=ar";
+        NSURL *url = [NSURL URLWithString:u];
+        if (!url) return nil;
+        req = [NSMutableURLRequest requestWithURL:url
+                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                  timeoutInterval:10];
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/x-www-form-urlencoded; charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [[@"q=" stringByAppendingString:enc] dataUsingEncoding:NSUTF8StringEncoding];
+    } else {
+        if (text.length > 500) return nil;
+        NSURL *url = [NSURL URLWithString:[@"https://lingva.ml/api/v1/auto/ar/" stringByAppendingString:enc]];
+        if (!url) return nil;
+        req = [NSMutableURLRequest requestWithURL:url
+                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                  timeoutInterval:10];
+        req.HTTPMethod = @"GET";
+    }
+    return req;
+}
+
+static void OTTryProvider(NSUInteger provider, NSString *text, void (^done)(NSString *)) {
+    if (provider >= 3) { done(nil); return; }
+    NSMutableURLRequest *req = OTBuildRequest(provider, text);
+    if (!req) { OTTryProvider(provider + 1, text, done); return; }
+    [[OTSession() dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *resp, NSError *err) {
+        NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)resp statusCode] : 0;
+        NSString *res = (!err && code == 200) ? OTParseJSON(d) : nil;
+        if (res) { done(res); return; }
+        NSString *why;
+        if (err) {
+            why = [NSString stringWithFormat:@"P%lu err %ld", (unsigned long)provider, (long)err.code];
+        } else {
+            why = [NSString stringWithFormat:@"P%lu HTTP %ld", (unsigned long)provider, (long)code];
+        }
+        OTSetErr(why);
+        OTTryProvider(provider + 1, text, done);
     }] resume];
+}
+
+static void OTTranslateText(NSString *text, void (^done)(NSString *)) {
+    if (gOKCount == 0 && gFailCount >= 6) { done(nil); return; }
+    OTTryProvider(0, text, ^(NSString *out) {
+        if (out) __sync_fetch_and_add(&gOKCount, 1);
+        else __sync_fetch_and_add(&gFailCount, 1);
+        done(out);
+    });
 }
 
 static void OTTranslateWebView(WKWebView *wv) {
     gBusy = YES;
     gButton.alpha = 0.5;
+    gOKCount = 0;
+    gFailCount = 0;
+    OTSetErr(nil);
     OTToast(@"جارٍ الترجمة…");
     [wv evaluateJavaScript:kOTCollectJS completionHandler:^(id result, NSError *error) {
         NSArray *texts = nil;
@@ -186,7 +271,7 @@ static void OTTranslateWebView(WKWebView *wv) {
                 if (s.length) [uniq addObject:s];
             }
             NSMutableDictionary<NSString *, NSString *> *cache = [NSMutableDictionary dictionary];
-            dispatch_semaphore_t sem = dispatch_semaphore_create(6);
+            dispatch_semaphore_t sem = dispatch_semaphore_create(4);
             dispatch_group_t grp = dispatch_group_create();
             for (NSString *t in uniq) {
                 dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
@@ -208,10 +293,14 @@ static void OTTranslateWebView(WKWebView *wv) {
                 @synchronized (cache) { tr = cache[s]; }
                 if (tr) map[[NSString stringWithFormat:@"%lu", (unsigned long)i]] = tr;
             }
-            if (map.count == 0) { OTFinish(@"فشلت الترجمة، تحقق من الاتصال"); return; }
+            if (map.count == 0) {
+                NSString *why = OTGetErr();
+                OTFinish([NSString stringWithFormat:@"فشلت الترجمة [%@]", why.length ? why : @"?"]);
+                return;
+            }
             NSData *jd = [NSJSONSerialization dataWithJSONObject:map options:0 error:nil];
             NSString *js = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : nil;
-            if (!js) { OTFinish(@"فشلت الترجمة"); return; }
+            if (!js) { OTFinish(@"فشلت الترجمة (JSON)"); return; }
             dispatch_async(dispatch_get_main_queue(), ^{
                 NSString *call = [NSString stringWithFormat:@"window.__otApply(%@)", js];
                 [wv evaluateJavaScript:call completionHandler:^(id r, NSError *e) {
