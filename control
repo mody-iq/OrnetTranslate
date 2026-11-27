@@ -1,0 +1,9 @@
+Package: com.mody.ornettranslate
+Name: OrnetTranslate
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Translate pages to Arabic inside OrNET Browser
+Maintainer: mody
+Author: mody
+Section: Tweaks
+Depends: mobilesubstrate
